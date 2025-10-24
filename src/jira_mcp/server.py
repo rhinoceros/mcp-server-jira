@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import json
 import logging
 import os
 import base64
@@ -28,27 +29,47 @@ ATTACHMENTS_DIR = os.path.expanduser("~/.jira_mcp")
 os.makedirs(ATTACHMENTS_DIR, exist_ok=True)
 
 
-def get_attachment_path(issue_key: str, filename: str) -> str:
-    """获取附件在本地文件系统中的保存路径."""
-    # 创建问题专属目录
-    issue_dir = os.path.join(ATTACHMENTS_DIR, issue_key)
-    os.makedirs(issue_dir, exist_ok=True)
-    return os.path.join(issue_dir, filename)
+def _serialize_jira_object(obj):
+    """序列化JIRA对象为JSON兼容格式."""
+    if obj is None:
+        return None
 
+    # 处理 User 对象
+    if hasattr(obj, 'name') and hasattr(obj, 'displayName'):
+        return {
+            "name": obj.name,
+            "display_name": obj.displayName,
+            "email": getattr(obj, 'emailAddress', None)
+        }
 
-def get_jira_client() -> JIRA:
-    """获取JIRA客户端实例."""
-    global jira_client
-    if jira_client is None:
-        auth = get_jira_auth()
-        jira_client = JIRA(server=jira_settings.server_url, basic_auth=auth)
-    return jira_client
+    # 处理 CustomFieldOption 对象
+    if hasattr(obj, 'value'):
+        option_data = {"value": obj.value}
+        if hasattr(obj, 'id'):
+            option_data["id"] = obj.id
+        if hasattr(obj, 'name'):
+            option_data["name"] = obj.name
+        return option_data
+
+    # 处理列表
+    if isinstance(obj, list):
+        return [_serialize_jira_object(item) for item in obj]
+
+    # 处理字典
+    if isinstance(obj, dict):
+        return {key: _serialize_jira_object(value) for key, value in obj.items()}
+
+    # 对于其他不可序列化的对象，转换为字符串
+    try:
+        return str(obj)
+    except Exception:
+        return f"<Unserializable object of type {type(obj).__name__}>"
 
 
 def format_issue(issue) -> Dict[str, Any]:
     """格式化JIRA问题为JSON友好格式."""
     fields = issue.fields
-    
+
     result = {
         "id": issue.id,
         "key": issue.key,
@@ -68,72 +89,119 @@ def format_issue(issue) -> Dict[str, Any]:
         "created": fields.created,
         "updated": fields.updated,
     }
-    
-    # 添加可选字段
+
+    # 添加可选字段并处理不可序列化的对象
     if hasattr(fields, "assignee") and fields.assignee:
-        result["assignee"] = {
-            "name": fields.assignee.name,
-            "display_name": fields.assignee.displayName,
-            "email": getattr(fields.assignee, "emailAddress", ""),
-        }
-    
+        # 处理 User 对象
+        assignee_data = {}
+        if hasattr(fields.assignee, 'name'):
+            assignee_data["name"] = fields.assignee.name
+        if hasattr(fields.assignee, 'displayName'):
+            assignee_data["display_name"] = fields.assignee.displayName
+        if hasattr(fields.assignee, 'emailAddress'):
+            assignee_data["email"] = fields.assignee.emailAddress
+        # 如果仍然无法获取基本信息，则转换为字符串
+        if not assignee_data:
+            assignee_data = str(fields.assignee)
+        result["assignee"] = assignee_data
+
     if hasattr(fields, "reporter") and fields.reporter:
-        result["reporter"] = {
-            "name": fields.reporter.name,
-            "display_name": fields.reporter.displayName,
-            "email": getattr(fields.reporter, "emailAddress", ""),
-        }
-    
+        # 处理 User 对象
+        reporter_data = {}
+        if hasattr(fields.reporter, 'name'):
+            reporter_data["name"] = fields.reporter.name
+        if hasattr(fields.reporter, 'displayName'):
+            reporter_data["display_name"] = fields.reporter.displayName
+        if hasattr(fields.reporter, 'emailAddress'):
+            reporter_data["email"] = fields.reporter.emailAddress
+        # 如果仍然无法获取基本信息，则转换为字符串
+        if not reporter_data:
+            reporter_data = str(fields.reporter)
+        result["reporter"] = reporter_data
+
     if hasattr(fields, "issuetype") and fields.issuetype:
         result["issue_type"] = {
             "id": fields.issuetype.id,
             "name": fields.issuetype.name,
             "description": fields.issuetype.description,
         }
-    
+
     if hasattr(fields, "priority") and fields.priority:
-        result["priority"] = {
-            "id": fields.priority.id,
-            "name": fields.priority.name,
-        }
-    
+        # 处理 Priority 对象
+        if hasattr(fields.priority, 'id') and hasattr(fields.priority, 'name'):
+            result["priority"] = {
+                "id": fields.priority.id,
+                "name": fields.priority.name,
+            }
+        else:
+            # 如果无法获取详细信息，则转换为字符串
+            result["priority"] = str(fields.priority)
+
     if hasattr(fields, "components") and fields.components:
-        result["components"] = [
-            {"id": c.id, "name": c.name} for c in fields.components
-        ]
-    
+        components_data = []
+        for c in fields.components:
+            if hasattr(c, 'id') and hasattr(c, 'name'):
+                components_data.append({"id": c.id, "name": c.name})
+            else:
+                components_data.append(str(c))
+        result["components"] = components_data
+
     if hasattr(fields, "labels") and fields.labels:
         result["labels"] = fields.labels
-    
+
     # 处理附件 - JIRA API 使用 "attachment" 字段
     if hasattr(fields, "attachment") and fields.attachment:
-        result["attachments"] = [
-            {
+        attachments_data = []
+        for attachment in fields.attachment:
+            attachment_data = {
                 "id": attachment.id,
                 "filename": attachment.filename,
                 "size": attachment.size,
-                "content_type": attachment.mimeType,
-                "created": attachment.created,
-                "url": attachment.content
+                "content_type": getattr(attachment, 'mimeType', ''),
+                "created": str(attachment.created) if hasattr(attachment, 'created') else '',
+                "url": str(attachment.content) if hasattr(attachment, 'content') else ''
             }
-            for attachment in fields.attachment
-        ]
-    
-    # 获取自定义字段
+            attachments_data.append(attachment_data)
+        result["attachments"] = attachments_data
+
+    # 获取自定义字段并处理各种不可序列化的对象
     for field_name in dir(fields):
         if field_name.startswith("customfield_"):
             value = getattr(fields, field_name)
             if value is not None:
-                result[field_name] = value
-    
+                try:
+                    # 尝试直接序列化
+                    json.dumps(value)
+                    result[field_name] = value
+                except (TypeError, ValueError):
+                    # 如果无法序列化，则进行特殊处理
+                    result[field_name] = _serialize_jira_object(value)
+
     return result
+
+
+def get_attachment_path(issue_key: str, filename: str) -> str:
+    """获取附件在本地文件系统中的保存路径."""
+    # 创建问题专属目录
+    issue_dir = os.path.join(ATTACHMENTS_DIR, issue_key)
+    os.makedirs(issue_dir, exist_ok=True)
+    return os.path.join(issue_dir, filename)
+
+
+def get_jira_client() -> JIRA:
+    """获取JIRA客户端实例."""
+    global jira_client
+    if jira_client is None:
+        auth = get_jira_auth()
+        jira_client = JIRA(server=jira_settings.server_url, basic_auth=auth)
+    return jira_client
 
 
 @mcp.tool(
     description="获取JIRA问题详情",
 )
 def get_issue(
-    issue_key: str,
+        issue_key: str,
 ) -> Dict[str, Any]:
     """获取JIRA问题详情.
     
@@ -157,8 +225,8 @@ def get_issue(
     description="获取JIRA问题附件",
 )
 def get_issue_attachment(
-    issue_key: str,
-    attachment_id: str,
+        issue_key: str,
+        attachment_id: str,
 ) -> Dict[str, Any]:
     """获取JIRA问题附件内容.
     
@@ -173,32 +241,32 @@ def get_issue_attachment(
     try:
         client = get_jira_client()
         issue = client.issue(issue_key)
-        
+
         # 查找指定ID的附件
         attachment = None
-        
+
         # 检查attachments字段
         attachments = []
         if hasattr(issue.fields, "attachments") and issue.fields.attachments:
             attachments = issue.fields.attachments
         elif hasattr(issue.fields, "attachment") and issue.fields.attachment:
             attachments = issue.fields.attachment
-            
+
         for att in attachments:
             if att.id == attachment_id:
                 attachment = att
                 break
-        
+
         if not attachment:
             return {"error": f"未找到ID为 {attachment_id} 的附件"}
-        
+
         # 获取附件内容
         content = attachment.get()
-        
+
         # 确定返回类型：对于图片类型，返回Base64编码；对于文本类型，返回文本内容
         mime_type = attachment.mimeType
         filename = attachment.filename
-        
+
         result = {
             "id": attachment.id,
             "filename": filename,
@@ -206,7 +274,7 @@ def get_issue_attachment(
             "content_type": mime_type,
             "created": attachment.created,
         }
-        
+
         # 处理不同的内容类型
         if mime_type.startswith("image/"):
             # 对于图片，返回Base64编码
@@ -225,7 +293,7 @@ def get_issue_attachment(
             # 对于其他类型，返回Base64编码
             result["content"] = base64.b64encode(content).decode('utf-8')
             result["encoding"] = "base64"
-        
+
         return result
     except Exception as e:
         logger.error(f"获取问题 {issue_key} 的附件 {attachment_id} 失败: {str(e)}")
@@ -236,9 +304,9 @@ def get_issue_attachment(
     description="搜索JIRA问题列表",
 )
 def search_issues(
-    jql: str,
-    max_results: int = 50,
-    start_at: int = 0
+        jql: str,
+        max_results: int = 50,
+        start_at: int = 0
 ) -> Dict[str, Any]:
     """搜索JIRA问题.
     
@@ -254,7 +322,7 @@ def search_issues(
     try:
         client = get_jira_client()
         issues = client.search_issues(jql_str=jql, maxResults=max_results, startAt=start_at)
-        
+
         return {
             "total": issues.total,
             "issues": [format_issue(issue) for issue in issues],
@@ -270,13 +338,13 @@ def search_issues(
     description="创建JIRA问题",
 )
 def create_issue(
-    project_key: str,
-    summary: str,
-    description: str = "",
-    issue_type: str = "Task",
-    priority: Optional[str] = None,
-    assignee: Optional[str] = None,
-    labels: Optional[List[str]] = None,
+        project_key: str,
+        summary: str,
+        description: str = "",
+        issue_type: str = "Task",
+        priority: Optional[str] = None,
+        assignee: Optional[str] = None,
+        labels: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """创建JIRA问题.
     
@@ -293,7 +361,7 @@ def create_issue(
         Dict[str, Any]: 创建的问题详情
     """
     logger.info(f"创建问题: project={project_key}, summary={summary}")
-    
+
     try:
         # 构建问题字段
         fields = {
@@ -301,19 +369,19 @@ def create_issue(
             "summary": summary,
             "issuetype": {"name": issue_type},
         }
-        
+
         if description:
             fields["description"] = description
-            
+
         if priority:
             fields["priority"] = {"name": priority}
-            
+
         if assignee:
             fields["assignee"] = {"name": assignee}
-            
+
         if labels:
             fields["labels"] = labels
-        
+
         # 创建问题
         client = get_jira_client()
         issue = client.create_issue(fields=fields)
@@ -327,13 +395,13 @@ def create_issue(
     description="更新JIRA问题",
 )
 def update_issue(
-    issue_key: str,
-    summary: Optional[str] = None,
-    description: Optional[str] = None,
-    issue_type: Optional[str] = None,
-    priority: Optional[str] = None,
-    assignee: Optional[str] = None,
-    labels: Optional[List[str]] = None,
+        issue_key: str,
+        summary: Optional[str] = None,
+        description: Optional[str] = None,
+        issue_type: Optional[str] = None,
+        priority: Optional[str] = None,
+        assignee: Optional[str] = None,
+        labels: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """更新JIRA问题.
     
@@ -350,37 +418,37 @@ def update_issue(
         Dict[str, Any]: 更新后的问题详情
     """
     logger.info(f"更新问题 {issue_key}")
-    
+
     try:
         # 构建更新字段
         fields = {}
-        
+
         if summary:
             fields["summary"] = summary
-            
+
         if description:
             fields["description"] = description
-            
+
         if issue_type:
             fields["issuetype"] = {"name": issue_type}
-            
+
         if priority:
             fields["priority"] = {"name": priority}
-            
+
         if assignee:
             fields["assignee"] = {"name": assignee}
-            
+
         if labels:
             fields["labels"] = labels
-        
+
         if not fields:
             return {"error": "未提供任何更新字段"}
-        
+
         # 更新问题
         client = get_jira_client()
         issue = client.issue(issue_key)
         issue.update(fields=fields)
-        
+
         # 获取更新后的问题
         updated_issue = client.issue(issue_key)
         return format_issue(updated_issue)
@@ -402,7 +470,7 @@ def get_projects() -> Dict[str, Any]:
     try:
         client = get_jira_client()
         projects = client.projects()
-        
+
         result = [
             {
                 "id": project.id,
@@ -412,7 +480,7 @@ def get_projects() -> Dict[str, Any]:
             }
             for project in projects
         ]
-        
+
         return {"projects": result}
     except Exception as e:
         logger.error(f"获取项目列表失败: {str(e)}")
@@ -423,7 +491,7 @@ def get_projects() -> Dict[str, Any]:
     description="获取JIRA项目详情",
 )
 def get_project(
-    project_key: str
+        project_key: str
 ) -> Dict[str, Any]:
     """获取项目详情.
     
@@ -437,7 +505,7 @@ def get_project(
     try:
         client = get_jira_client()
         project = client.project(project_key)
-        
+
         return {
             "id": project.id,
             "key": project.key,
@@ -455,7 +523,7 @@ def get_project(
     description="调试JIRA问题字段",
 )
 def debug_issue_fields(
-    issue_key: str,
+        issue_key: str,
 ) -> Dict[str, Any]:
     """查看JIRA问题的字段结构，用于调试.
     
@@ -469,15 +537,15 @@ def debug_issue_fields(
     try:
         client = get_jira_client()
         issue = client.issue(issue_key)
-        
+
         fields = []
         for field_name in dir(issue.fields):
             if field_name.startswith('_') or callable(getattr(issue.fields, field_name)):
                 continue
-                
+
             value = getattr(issue.fields, field_name)
             field_type = type(value).__name__
-            
+
             if field_name in ('attachment', 'attachments'):
                 if value:
                     attachment_info = []
@@ -496,7 +564,7 @@ def debug_issue_fields(
                 # 对于其他字段，仅显示类型信息和简单值
                 simple_value = str(value)[:100] if value is not None else None
                 fields.append({"name": field_name, "type": field_type, "preview": simple_value})
-        
+
         return {
             "id": issue.id,
             "key": issue.key,
@@ -511,9 +579,9 @@ def debug_issue_fields(
     description="根据问题ID和文件名获取JIRA附件",
 )
 def get_attachment_by_filename(
-    issue_key: str,
-    filename: str,
-    save_to_disk: bool = True,
+        issue_key: str,
+        filename: str,
+        save_to_disk: bool = True,
 ) -> Dict[str, Any]:
     """根据问题ID和文件名获取JIRA附件.
     
@@ -529,43 +597,43 @@ def get_attachment_by_filename(
     try:
         # 使用JIRA REST API直接获取问题附件
         client = get_jira_client()
-        
+
         # 获取问题详情
         issue_url = f"{jira_settings.server_url}/rest/api/2/issue/{issue_key}"
         response = client._session.get(issue_url)
         if response.status_code != 200:
             return {"error": f"获取问题失败: {response.text}"}
-            
+
         issue_data = response.json()
-        
+
         # 检查附件
         attachments = issue_data.get("fields", {}).get("attachment", [])
         if not attachments:
             return {"error": f"问题 {issue_key} 没有附件"}
-            
+
         # 查找指定文件名的附件
         attachment = None
         for att in attachments:
             if att.get("filename") == filename:
                 attachment = att
                 break
-                
+
         if not attachment:
             return {"error": f"未找到名为 {filename} 的附件"}
-            
+
         # 获取附件内容
         attachment_url = attachment.get("content")
         if not attachment_url:
             return {"error": "附件URL不存在"}
-            
+
         # 下载附件
         response = client._session.get(attachment_url)
         if response.status_code != 200:
             return {"error": f"下载附件失败: {response.text}"}
-            
+
         content = response.content
         mime_type = attachment.get("mimeType", "application/octet-stream")
-        
+
         result = {
             "id": attachment.get("id"),
             "filename": filename,
@@ -573,14 +641,14 @@ def get_attachment_by_filename(
             "content_type": mime_type,
             "created": attachment.get("created"),
         }
-        
+
         # 如果要保存到磁盘
         if save_to_disk:
             file_path = get_attachment_path(issue_key, filename)
             with open(file_path, "wb") as f:
                 f.write(content)
             result["local_path"] = file_path
-        
+
         # 处理不同的内容类型
         if mime_type.startswith("image/"):
             # 对于图片，返回Base64编码
@@ -599,7 +667,7 @@ def get_attachment_by_filename(
             # 对于其他类型，返回Base64编码
             result["content"] = base64.b64encode(content).decode('utf-8')
             result["encoding"] = "base64"
-        
+
         return result
     except Exception as e:
         logger.error(f"获取问题 {issue_key} 的附件 {filename} 失败: {str(e)}")
@@ -610,7 +678,7 @@ def get_attachment_by_filename(
     description="获取JIRA问题及其附件",
 )
 def getIssues(
-    issue_key: str,
+        issue_key: str,
 ) -> Dict[str, Any]:
     """获取JIRA问题及其附件信息.
     
@@ -624,10 +692,10 @@ def getIssues(
     try:
         client = get_jira_client()
         issue = client.issue(issue_key)
-        
+
         # 使用format_issue函数来获取JSON可序列化的问题数据
         issue_data = format_issue(issue)
-        
+
         # 确保附件列表为JSON可序列化对象
         return issue_data
     except Exception as e:
@@ -639,7 +707,7 @@ def getIssues(
     description="下载JIRA问题的所有附件到本地",
 )
 def download_all_attachments(
-    issue_key: str,
+        issue_key: str,
 ) -> Dict[str, Any]:
     """下载JIRA问题的所有附件到本地.
     
@@ -653,15 +721,15 @@ def download_all_attachments(
     try:
         client = get_jira_client()
         issue = client.issue(issue_key)
-        
+
         downloads = []
         failed = []
-        
+
         # 获取附件列表
         attachments = []
         if hasattr(issue.fields, "attachment") and issue.fields.attachment:
             attachments = issue.fields.attachment
-        
+
         if not attachments:
             return {
                 "issue_key": issue_key,
@@ -669,23 +737,23 @@ def download_all_attachments(
                 "total": 0,
                 "downloads": []
             }
-        
+
         # 为此问题创建目录
         issue_dir = os.path.join(ATTACHMENTS_DIR, issue_key)
         os.makedirs(issue_dir, exist_ok=True)
-        
+
         # 下载每个附件
         for attachment in attachments:
             try:
                 file_path = os.path.join(issue_dir, attachment.filename)
-                
+
                 # 下载内容
                 content = attachment.get()
-                
+
                 # 保存到文件
                 with open(file_path, "wb") as f:
                     f.write(content)
-                
+
                 downloads.append({
                     "id": attachment.id,
                     "filename": attachment.filename,
@@ -699,7 +767,7 @@ def download_all_attachments(
                     "filename": attachment.filename,
                     "error": str(e)
                 })
-        
+
         return {
             "issue_key": issue_key,
             "total": len(attachments),
@@ -718,8 +786,8 @@ def download_all_attachments(
     description="获取JIRA问题的所有附件",
 )
 def get_issue_attachments(
-    issue_key: str,
-    download: bool = False
+        issue_key: str,
+        download: bool = False
 ) -> Dict[str, Any]:
     """获取JIRA问题的所有附件信息.
     
@@ -731,21 +799,21 @@ def get_issue_attachments(
         Dict[str, Any]: 附件列表
     """
     logger.info(f"获取问题附件列表: {issue_key}, download={download}")
-    
+
     if download:
         return download_all_attachments(issue_key)
-    
+
     try:
         client = get_jira_client()
         issue = client.issue(issue_key)
-        
+
         attachments = []
         if hasattr(issue.fields, "attachment") and issue.fields.attachment:
             for attachment in issue.fields.attachment:
                 # 检查附件是否已存在于本地
                 local_path = get_attachment_path(issue_key, attachment.filename)
                 exists_locally = os.path.exists(local_path)
-                
+
                 attachments.append({
                     "id": attachment.id,
                     "filename": attachment.filename,
@@ -756,7 +824,7 @@ def get_issue_attachments(
                     "local_path": local_path if exists_locally else None,
                     "exists_locally": exists_locally
                 })
-        
+
         return {
             "issue_key": issue_key,
             "attachments": attachments,
@@ -773,20 +841,20 @@ def main():
     parser = argparse.ArgumentParser(description="Run the JIRA MCP Server")
     parser.add_argument("--config", "-c", help="Path to config file")
     parser.add_argument("--transport", "-t", choices=["sse", "stdio"], default="stdio")
-    
+
     args = parser.parse_args()
-    
+
     try:
         # 检查环境变量
         if not jira_settings.server_url:
             logger.warning("未设置JIRA_SERVER_URL环境变量")
-        
+
         if not jira_settings.username:
             logger.warning("未设置JIRA_USERNAME环境变量")
-        
+
         if not jira_settings.password and not jira_settings.api_token:
             logger.warning("未设置JIRA_PASSWORD或JIRA_API_TOKEN环境变量")
-        
+
         # 运行MCP服务器
         logger.info(f"Starting JIRA MCP Server with {args.transport} transport")
         mcp.run(transport=args.transport)
@@ -796,4 +864,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main() 
+    main()
